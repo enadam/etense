@@ -1,0 +1,48 @@
+#!/bin/sh
+
+ok="";
+nok="";
+flags="";
+while [ $# -ge 2 ];
+do
+	case "$1" in
+	-ok)
+		ok="$2";
+		shift;
+		shift;
+		;;
+	-nok)
+		nok="$2";
+		shift;
+		shift;
+		;;
+	-flags)
+		flags="$2";
+		shift;
+		shift;
+		;;
+	*)
+		break;
+		;;
+	esac
+done
+
+exe=`mktemp testif.XXXXXX`;
+src="$exe.c";
+for line;
+do
+	echo "$line" >> "$src";
+done
+echo 'int main(void) { return 0; }' >> "$src";
+
+if cc $flags "$src" -o "$exe" > /dev/null 2>&1;
+then
+	[ "$ok" != "" ] && echo "$ok";
+	code=0;
+else
+	[ "$nok" != "" ] && echo "$nok";
+	code=1;
+fi
+
+rm -f "$src" "$exe";
+exit $code;

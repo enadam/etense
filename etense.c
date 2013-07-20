@@ -1,17 +1,43 @@
 /*
- * etense.c
+ * etense.c -- enhanced Electric Fence
+ *
+ * XXX This whole mess is undocumented, sorry.
+ *
+ * Configuration:
+ *    Environment variable	C variable		default value
+ * -- $ETENSE_BANNER		--			0
+ * -- $ETENSE_ALIGNMENT		@ETense_Alignment	sizeof(int)
+ * -- $ETENSE_PROTECT_UNDER	@ETense_Protect_Under	1
+ * -- $ETENSE_PROTECT_OVER	@ETense_Protect_Over	1
+ * -- $ETENSE_TEND_LEFTWARD	@ETense_Tend_Leftward	Protect_Under
+ *							&& !Protect_Over
+ * -- $ETENSE_PROTECT_FREE	@ETense_Protect_Free	0
+ * -- $ETENSE_ZONE_CHECK	@ETense_Zone_Check	ETENSE_CHECK_ON_EXIT/
+ *				other possible values:	ETENSE_CHECK_ON_FREE
+ *				ETENSE_NO_CHECK		(depending on
+ *				ETENSE_CHECK_ALWAYS	 CONFIG_MULTITHREAD)
+ *
+ * Statistics:
+ * -- @ETense_AS_Now
+ * -- @ETense_AS_Max
+ * Other interfaces:
+ * -- void ETense_Check(void)
  *
  * TODO
  * -- new_entry() is
  *    -- thread and signal safe if HAVE_CMPXCHG
  *    -- otherwise thread safe if CONFIG_MULTITHREAD, but not signal safe
  *    -- otherwise more-or-less signal safe
- * -- ETense_Zone_Check > ETENSE_CHECK_ON_EXIT and ETense_Check()
- *    are neither thread safe (->owner is missing) nor signal safe
- *    (they mustn't be interrupted by free()).
+ * -- neither ETense_Zone_Check > ETENSE_CHECK_ON_EXIT nor ETense_Check()
+ *    are thread safe (->owner is missing) or signal safe (they mustn't be
+ *    interrupted by free()).
  * -- Neither is ETense_AS_Max.
  *
  * Otherwise we're supposed to be OK.
+ *
+ * TODO ETENSE_CHECK_ON_FREE seems to be unimplemented
+ * TODO Use the system's malloc() as backend for memory allocation,
+ *      because it's probably way faster than our dummy linked list.
  */
 
 /* Configuration {{{ */
@@ -36,29 +62,41 @@
 #endif
 
 #ifndef HAVE_SYS_USER_H
-# define HAVE_SYS_USER_H	1
+# define HAVE_SYS_USER_H	0
 #endif
 
-#ifndef CONFIG_X86_CMPXCHG
-# define CONFIG_X86_CMPXCHG	1
+/* HAVE_CMPXCHG (__sync_bool_compare_and_swap) if gcc >= 4.1 */
+#ifndef HAVE_CMPXCHG
+# define HAVE_CMPXCHG		GCC_AT_LEAST(4, 1)
+#endif
+
+#ifndef HAVE_PTHREAD_SPINLOCK
+# define HAVE_PTHREAD_SPINLOCK	(!HAVE_CMPXCHG)
+#endif
+
+#if CONFIG_MULTITHREAD && !HAVE_CMPXCHG && !HAVE_PTHREAD_SPINLOCK
+# error "CONFIG_MULTITHREAD needs either cmpxchg or pthread_spinlock."
 #endif
 /* }}} */
 
 /* Include files {{{ */
 #include <stdlib.h>
 #include <unistd.h>
+#include <stdio.h>
+#include <errno.h>
+
+#if CONFIG_MULTITHREAD && !HAVE_CMPXCHG
+# include <pthread.h>
+#endif
 
 #include <string.h>
 #include <signal.h>
 
 #include <sys/mman.h>
 
-/* The following headers are Linux-specific. */
+/* For PAGE_SIZE */
 #if HAVE_SYS_USER_H
-# include <sys/user.h>		/* For PAGE_SIZE */
-#endif
-#if HAVE_ASM_SYSTEM_H
-# include <asm/system.h>	/* For cmpxchg() */
+# include <sys/user.h>
 #endif
 
 #include "etense.h"
@@ -85,25 +123,26 @@
 /* }}} */
 
 /* Type definitions {{{ */
-/* An integer that can store an address.
+/* An integer that can store an address (a pointer).
  * XXX It is certainly not certain that unsigned long is wide enough.
- * I've heard stories about 128-bit wide pointers. */
+ *     I've heard stories about 128-bit wide pointers. */
 typedef unsigned long ptr_t;
+STATIC_ASSERT(sizeof(ptr_t) >= sizeof(void *));
 
 struct regentry_st
 {
 	volatile sig_atomic_t lock;
 	volatile sig_atomic_t flags;
 
-	char *paddr, *uaddr;
+	unsigned char *paddr, *uaddr;
 	size_t psize, usize;
 	unsigned alignment;
 };
 
 struct registry_st
 {
-#if CONFIG_MULTITHREAD && ! __HAVE_ARCH_CMPXCHG
-	spinlock_t lock;
+#if CONFIG_MULTITHREAD && !HAVE_CMPXCHG
+	pthread_spinlock_t lock;
 #endif
 
 	struct registry_st *volatile next;
@@ -121,12 +160,13 @@ enum caller_t
 
 /* Function prototypes {{{ */
 /* Birth and death */
-static void panic(char const *msg)
-	__attribute__((noreturn));
-static void init(void)
-	__attribute__((constructor));
-static void done(void)
-	__attribute__((destructor));
+static void __attribute__((noreturn))
+	panic(char const *msg);
+static void printopt(int fd, char const *str, int val);
+static void __attribute__((constructor))
+	init(void);
+static void __attribute__((destructor))
+	done(void);
 
 /* Page allocation */
 static size_t round_to_pagesize(size_t size);
@@ -170,7 +210,7 @@ static void do_free(struct registry_st *tl, struct regentry_st *te);
 /* Private variables */
 static size_t Pagesize;
 static unsigned Entries_per_page;
-static struct registry_st *tense_alist;
+static struct registry_st *Tense_alist;
 
 /* Global variables */
 /* Be conservative with the default alignment. */
@@ -178,7 +218,7 @@ ETENSE_GLOBAL unsigned ETense_Alignment = sizeof(int);
 ETENSE_GLOBAL int ETense_Tend_Leftward	= -1;
 ETENSE_GLOBAL int ETense_Protect_Under	= -1;
 ETENSE_GLOBAL int ETense_Protect_Over	= -1;
-ETENSE_GLOBAL int ETense_Protect_Free	= 0;
+ETENSE_GLOBAL int ETense_Protect_Free	=  0;
 #if !CONFIG_MULTITHREAD
 ETENSE_GLOBAL unsigned ETense_Zone_Check = ETENSE_CHECK_ON_EXIT;
 #else
@@ -224,11 +264,11 @@ void *realloc(void *ptr, size_t size)
 
 	/*
 	 * malloc(3) says:
+	 * -- realloc(NULL,  0) == malloc( 0)
 	 * -- realloc(NULL, !0) == malloc(!0)
 	 * -- realloc(not-NULL, 0) == free(not-NULL)
 	 * -- realloc()ing anything to the same size is nop
 	 * -- malloc(0) returns not-NULL
-	 * -- free(NULL) is considered a bug
 	 */
 	if (!ptr)
 		return do_malloc(M_MALLOC, ETense_Alignment, size);
@@ -249,6 +289,8 @@ void free(void *ptr)
 	struct registry_st *tl;
 	struct regentry_st *te;
 
+	if (!ptr)
+		return;
 	get_entry(&tl, &te, ptr);
 	do_free(tl, te);
 } /* free */
@@ -260,7 +302,7 @@ void ETense_Check(void)
 	unsigned i;
 	struct registry_st *tl;
 
-	for (tl = tense_alist; tl; tl = tl->next)
+	for (tl = Tense_alist; tl; tl = tl->next)
 		for (i = 0; i < Entries_per_page; i++)
 			if (tl->entries[i].flags & TE_COMPLETE)
 				chkzone(&tl->entries[i]);
@@ -282,15 +324,35 @@ void panic(char const *msg)
 		pause();
 } /* panic */
 
+void printopt(int fd, char const *str, int val)
+{
+	write(fd, str, strlen(str));
+	if (val)
+		write(fd, STR_LEN("on"));
+	else
+		write(fd, STR_LEN("off"));
+} /* printopt */
+
 void init(void)
 {
+	static int inited;
 	int n;
 	char const *s;
+
+	if (!inited)
+		inited = -1;
+	else if (inited > 0)
+		return;
+	else
+	{	/* Don't call init() again. */
+		inited = 1;
+		panic("init() interrupted");
+	}
 
 	/* Get Pagesize. */
 #if defined(PAGE_SIZE)
 	Pagesize = PAGE_SIZE;
-#elif defined(HAVE_GETPAGESIZE)
+#elif HAVE_GETPAGESIZE
 	Pagesize = getpagesize();
 #elif defined(_SC_PAGE_SIZE)
 	Pagesize = sysconf(_SC_PAGE_SIZE);
@@ -300,10 +362,10 @@ void init(void)
 	Pagesize = 4096;
 #endif
 
-	/* Allocate tense_alist. */
-	Entries_per_page = (Pagesize-VARST_SIZE(tense_alist, entries, 0))
-		/ sizeof(tense_alist->entries);
-	if (!(tense_alist = new_alist()))
+	/* Allocate Tense_alist. */
+	Entries_per_page = (Pagesize-VARST_SIZE(Tense_alist, entries, 0))
+		/ sizeof(Tense_alist->entries);
+	if (!(Tense_alist = new_alist()))
 		panic("init: can't allocate memory for the register");
 
 	/* Import configuration from the environment variables. */
@@ -334,6 +396,29 @@ void init(void)
 	if (ETense_Tend_Leftward < 0)
 		ETense_Tend_Leftward = ETense_Protect_Under
 			&& !ETense_Protect_Over;
+
+	if ((s = getenv("ETENSE_BANNER")) != NULL && (n = atoi(s)) > 0)
+	{	/* Print banner on $n:th file descriptor. */
+		write(n, STR_LEN("Electric Tense is active\n"
+			"------------------------\n"
+			"\n"));
+		printopt(n, "protect over: ", ETense_Protect_Over);
+		printopt(n, ", protect under: ", ETense_Protect_Under);
+		printopt(n, ", tend leftward: ", ETense_Tend_Leftward);
+		write(n, STR_LEN("\n"));
+		printopt(n, "protect free: ", ETense_Protect_Free);
+		write(n, STR_LEN(", zone check: "));
+		if (ETense_Zone_Check == ETENSE_NO_CHECK)
+			write(n, STR_LEN("none\n\n"));
+		else if (ETense_Zone_Check == ETENSE_CHECK_ON_FREE)
+			write(n, STR_LEN("on free\n\n"));
+		else if (ETense_Zone_Check == ETENSE_CHECK_ON_EXIT)
+			write(n, STR_LEN("on exit\n\n"));
+		else
+			write(n, STR_LEN("always\n\n"));
+	}
+
+	inited = 1;
 } /* init */
 
 void done(void)
@@ -449,6 +534,9 @@ struct registry_st *new_alist(void)
 		return NULL;
 
 	memset(tl, 0, Pagesize);
+#if CONFIG_MULTITHREAD && !HAVE_CMPXCHG
+	pthread_spin_init(&tl->lock, 0);
+#endif
 	tl->free_entries = Entries_per_page;
 
 	return tl;
@@ -456,6 +544,9 @@ struct registry_st *new_alist(void)
 
 void free_alist(struct registry_st *tl)
 {
+#if CONFIG_MULTITHREAD && !HAVE_CMPXCHG
+	pthread_spin_destroy(&tl->lock, 0);
+#endif
 	free_pages(tl, Pagesize);
 } /* free_alist */
 
@@ -469,7 +560,11 @@ int new_entry(struct registry_st **tlp, struct regentry_st **tep)
 	if (ETense_Zone_Check >= ETENSE_CHECK_ALWAYS)
 		ETense_Check();
 
-	for (tl = tense_alist; ; tl = tl->next)
+	// Is somebody trying to allocate memory before our init() has run? */
+	if (!Tense_alist)
+		init();
+
+	for (tl = Tense_alist; ; tl = tl->next)
 	{
 		struct registry_st *nl __attribute((unused));
 
@@ -499,25 +594,26 @@ int new_entry(struct registry_st **tlp, struct regentry_st **tep)
 		} /* for */
 
 		/* Goto the next `tl'. */
-#if __HAVE_ARCH_CMPXCHG
+#if HAVE_CMPXCHG
 		/* Thread safe and reentrant. */
 		if (tl->next)
 			continue;
 		if (!(nl = new_alist()))
 			return 0;
-		if (cmpxchg(&tl->next, 0, nl) != 0)
+		/* tl->next <- nl if !tl->next; otherwise free(nl). */
+		if (!__sync_bool_compare_and_swap(&tl->next, NULL, nl))
 			free_alist(nl);
-#elif CONFIG_MULTITHREAD
-		/* XXX I don't think spin_lock_sy() is reentrant. */
+#elif CONFIG_MULTITHREAD /* && !HAVE_CMPXCHG && HAVE_PTHREAD_SPINLOCK */
+		/* XXX I don't think pthread_spin_lock() is reentrant. */
 		if (tl->next)
 			continue;
-		spin_lock_sy(&tl->lock);
+		pthread_spin_lock(&tl->lock);
 		if (!tl->next)
 			tl->next = new_alist();
-		spin_unlock(&tl->lock);
+		pthread_spin_unlock(&tl->lock);
 		if (!tl->next)
 			return 0;
-#else /* ! CONFIG_MULTITHREAD && ! HAVE_CMPXCHG */
+#else /* !CONFIG_MULTITHREAD && !HAVE_CMPXCHG */
 		/* XXX Not reentrant. */
 		if (!tl->next && !(tl->next = new_alist()))
 			return 0;
@@ -537,9 +633,9 @@ void get_entry(struct registry_st **tlp, struct regentry_st **tep,
 
 	if (ptr == NULL)
 		panic("get_entry: searching for zero address "
-			"(attempt to free(NULL) ?)");
+			"(attempt to free(NULL)?)");
 
-	for (tl = tense_alist; tl; tl = tl->next)
+	for (tl = Tense_alist; tl; tl = tl->next)
 	{
 		for (i = Entries_per_page, te = tl->entries; i > 0;
 			i--, te++)
@@ -595,7 +691,7 @@ void chkzone(struct regentry_st const *te)
 	if (!(te->flags & TE_ZONED))
 		return;
 
-	/* Before user area */
+	/* In front of user area */
 	ptr = te->paddr;
 	if (te->flags & TE_UNDER)
 		ptr += Pagesize;
@@ -604,7 +700,7 @@ void chkzone(struct regentry_st const *te)
 			panic("chkzone: red zone integrity violated "
 				"(buffer underrun?)");
 
-	/* Past user ares */
+	/* Past user area */
 	end = te->paddr + te->psize;
 	if (te->flags & TE_OVER)
 		end -= Pagesize;
@@ -652,10 +748,19 @@ void *do_malloc(enum caller_t caller, size_t alignment, size_t size)
 
 void *do_realloc(struct regentry_st *te, size_t size)
 {
-#ifndef MREMAP_MAYMOVE
 	struct regentry_st nt;
 
-	/* mmap() another region and copy over te->uaddr. */
+#ifdef MREMAP_MAYMOVE
+	void *ptr;
+
+	/* Use mremap(). */
+	if ((ptr = do_malloc_real(NULL, te, M_REALLOC,
+			get_flags(te), te->alignment, size)) != NULL)
+		return ptr;
+#endif /* MREMAP_MAYMOVE */
+
+	/* mmap() another region and copy over te->uaddr.  For some
+	 * reason this may work even if mremap() fails. */
 	nt.flags = get_flags(te);
 	if (!do_malloc_real(NULL, &nt, M_MALLOC,
 			nt.flags, te->alignment, size))
@@ -672,11 +777,6 @@ void *do_realloc(struct regentry_st *te, size_t size)
 	te->flags |= nt.flags;
 
 	return te->uaddr;
-#else
-	/* Use mremap(). */
-	return do_malloc_real(NULL, te, M_REALLOC,
-		get_flags(te), te->alignment, size);
-#endif /* ! MREMAP_MAYMOVE */
 } /* do_realloc */
 /* }}} */
 
@@ -731,9 +831,9 @@ void *do_malloc_real(struct registry_st *tl, struct regentry_st *te,
 	size_t usize)
 {
 	int dont_reprotect;
-	char *paddr, *old_uaddr;
 	size_t psize, old_usize;
 	unsigned pzleft, pzright, more;
+	unsigned char *paddr, *old_uaddr;
 
 	old_usize = 0;
 	old_uaddr = NULL;
@@ -835,8 +935,8 @@ void *do_malloc_real(struct registry_st *tl, struct regentry_st *te,
 
 	/* te->paddr is finalized. */
 	te->flags |= flags;
-	te->paddr = paddr;
-	te->psize = psize;
+	te->paddr  = paddr;
+	te->psize  = psize;
 
 	/* Activate the fence. */
 	/* In case of realloc, the memory is already realloced,

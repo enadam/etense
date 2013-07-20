@@ -1,8 +1,40 @@
 /*
- * test.c
+ * test.c -- fuzzy test for libetense
+ *
+ * Synopsis:
+ *   test [-1] [-S <seed>] [-n <nrounds>] [-m [<nmems>] [-s <???>]
+ *
+ * Options:
+ *   -1			Just allocate a single memory region, and then
+ *			reallocate it many times subsequently.  Otherwise
+ *			allocate up to <nmems> memory regions and do the
+ *			same to them.
+ *   -S <seed>		Specify the seed of the PRNG used for fuzzying.
+ *			If left unspecified, it will be initialized from
+ *			the current time.  The seed is printed at every
+ *			invocation of the program, thus you can use this
+ *			option to reproduce an earlier test sequence.
+ *   -n <nrounds>	If not -1, specifies the number of times each
+ *			memory region is tested.
+ *   -m <nmems>		Tells the maximum number of memory allocations
+ *			to test in ! -1 mode.
+ *   -s <???>		XXX No idea.
+ *
+ * The tests performed on a memory region are:
+ * -- allocating it with varying alignments
+ * -- reallocating it randomly
+ * -- trying to (re)allocate insanely large amounts of memory
+ * -- testing whether the fences work by over/underflowing the memory region
+ * -- freeing it
+ *
+ * TODO What is @isfake used for?
+ * TODO Multithreading is completely untested.
+ * TODO documentation
  */
 
 /* Include files */
+#define _GNU_SOURCE
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -18,10 +50,14 @@
 #include <signal.h>
 #include <time.h>
 #include <getopt.h>
+#include <dlfcn.h>
 
 #include <sys/wait.h>
+#if HAVE_SYS_USER_H
+# include <sys/user.h>		/* for PAGE_SIZE */
+#endif
 
-#include <adios.h>
+#include "adios.h"
 #include "etense.h"
 
 /* Standard definitions */
@@ -36,11 +72,14 @@
 #define RANGE			MEAN
 
 /* The amount of memory you shouldn't be able to malloc. */
-#define TOOMUCH			2000L * 1024*1024
+#ifdef __LP64__
+# define TOOMUCH		(1L * 1024*1024*1024 * 64)
+#else
+# define TOOMUCH		(1L * 1024*1024*1024 *  2)
+#endif
 
 #ifndef PAGE_SIZE
-  /* Just a wild guess. */
-# define PAGE_SIZE		4096
+# define PAGE_SIZE		4096 /* Just a wild guess. */
 #endif
 
 /* Type definitions */
@@ -54,7 +93,21 @@ struct memory_st
 };
 
 /* Private variables */
-static unsigned Round, Slot;
+static unsigned Pagesize, Round, Slot;
+
+#ifdef CONFIG_ETENSE_PRELOAD
+static int *My_ETense_Tend_Leftward;
+static int *My_ETense_Protect_Under;
+static int *My_ETense_Protect_Over;
+static unsigned *My_ETense_Zone_Check;
+static void (*My_ETense_Check)(void);
+
+# define ETense_Tend_Leftward	(*My_ETense_Tend_Leftward)
+# define ETense_Protect_Under	(*My_ETense_Protect_Under)
+# define ETense_Protect_Over	(*My_ETense_Protect_Over)
+# define ETense_Zone_Check	(*My_ETense_Zone_Check)
+# define ETense_Check		My_ETense_Check
+#endif /* CONFIG_ETENSE_PRELOAD */
 
 /* Program code */
 /* Return a random float from a Gaussian distribution
@@ -108,27 +161,24 @@ static void logit(int isfake, char const *op, char const *fmt, ...)
 	if (isfake)
 		return;
 
-#if 1
-	snprintf(str, sizeof(str), "%u %u %s\t", Round, Slot, op);
-	write(STDERR_FILENO, str, strlen(str));
+	snprintf(str, sizeof(str), "%u %u %s", Round, Slot, op);
+	write(STDOUT_FILENO, str, strlen(str));
 	if (fmt)
 	{
+		write(STDOUT_FILENO, "\t", 1);
 		va_start(printf_args, fmt);
 		vsnprintf(str, sizeof(str), fmt, printf_args);
-		write(STDERR_FILENO, str, strlen(str));
+		write(STDOUT_FILENO, str, strlen(str));
 		va_end(printf_args);
 	}
-#else
-	write(STDERR_FILENO, op, strlen(op));
-#endif
-
-	write(STDERR_FILENO, STR_LEN("\n"));
+	write(STDOUT_FILENO, STR_LEN("\n"));
 } /* logit */
 
 /* Does the fence work? */
 static void negtest_user(struct memory_st *mem, int isfake)
 {
 #if CONFIG_ETENSE
+	pid_t pid;
 	int can_under, can_over;
 
 	if (isfake)
@@ -137,36 +187,60 @@ static void negtest_user(struct memory_st *mem, int isfake)
 	/* Don't expect an under/overwlow detected
 	 * if `mem' is not protected against it. */
 	can_under = mem->left  || !is_aligned(mem->addr, PAGE_SIZE);
-	can_over  = mem->right || !is_aligned(mem->addr + mem->size, PAGE_SIZE);
+	can_over  = mem->right || !is_aligned(mem->addr + mem->size,
+					PAGE_SIZE);
 	if (!can_under && !can_over)
 	{
 		logit(0, "NEGTEST", NULL);
 		return;
 	}
 
-	if (!fork())
+	if (!(pid = fork()))
 	{
+		int i;
+
 		/* Simulate a buffer overrun or underrun. */
 		if (can_over && (!can_under || rand() % 2))
 		{
 			logit(0, "NEGTEST OVER", NULL);
 			mem->addr[mem->size]++;
+			for (i = 0; i < 2000; i++)
+				mem->addr[mem->size + i]++;
 		} else
 		{
 			logit(0, "NEGTEST UNDER", NULL);
-			mem->addr[-1]++;
+			for (i = -1; i > -2000; i--)
+				mem->addr[i]++;
 		}
 
-		/* Even if the MM was unable to catch us
-		 * the damage made to the red zone ought
-		 * to not remain unnoticed. */
+		/* Even if the MM was unable to catch us the damage
+		 * made to the red zone ought to not remain unnoticed. */
 		ETense_Check();
 
 		/* By now we should be dead. */
 		logit(0, "FUCKUP", NULL);
 		abort();
 	} else
-		wait(NULL);
+	{
+		int status;
+
+		if (waitpid(pid, &status, 0) != pid)
+		{
+			logit(0, "NOWAIT", NULL);
+			abort();
+		} else if (!WIFSIGNALED(status))
+		{
+			logit(0, "NOSIGNAL", NULL);
+			abort();
+		} else if (WTERMSIG(status) == SIGSEGV)
+		{
+			logit(0, "SIGSEGV", NULL);
+		} else if (WTERMSIG(status) != SIGABRT)
+		{
+			logit(0, "BADSIGNAL", NULL);
+			abort();
+		}
+	}
 #endif /* CONFIG_ETENSE */
 } /* negtest_user */
 
@@ -231,7 +305,6 @@ static void test_realloc(struct memory_st *mem, size_t newsize, int isfake)
 {
 	size_t oldsize;
 
-	logit(isfake, "REALLOC", "%u", newsize);
 	oldsize = mem->size;
 	mem->size = newsize;
 
@@ -243,9 +316,13 @@ static void test_realloc(struct memory_st *mem, size_t newsize, int isfake)
 		return;
 	}
 
+	logit(isfake, "REALLOC", "%p: %u -> %u",
+		mem->addr, oldsize, newsize);
 	mem->addr = realloc(mem->addr, newsize);
 	if (newsize)
 	{
+		if (mem->addr == NULL)
+			abort();
 		assert(mem->addr != NULL);
 		assert(is_aligned(mem->addr, mem->align));
 
@@ -267,7 +344,7 @@ static void negtest_realloc(struct memory_st *mem, int isfake)
 	if (isfake)
 		return;
 
-	assert(realloc(mem->addr,  TOOMUCH) == NULL);
+	assert(realloc(mem->addr, TOOMUCH) == NULL);
 	test_user(mem, mem->size);
 	negtest_user(mem, isfake);
 } /* negtest_realloc */
@@ -312,7 +389,7 @@ static void test_many(unsigned nrounds, unsigned nmems, int skipbut)
 				test_realloc(mem, grand(MEAN, RANGE), isfake);
 				break;
 			case 2:
-				negtest_realloc(mem, isfake);
+				// negtest_realloc(mem, isfake);
 				break;
 			case 3:
 				negtest_user(mem, isfake);
@@ -345,6 +422,24 @@ static void test_one(unsigned nrounds)
 	} /* for */
 	logit(0, "DONE!", NULL);
 }
+
+#ifdef CONFIG_ETENSE_PRELOAD
+static void *resolve(char const *name)
+{
+	void *sym;
+	char const *error;
+
+	dlerror();
+	sym = dlsym(RTLD_DEFAULT, name);
+	if ((error = dlerror()))
+	{
+		fprintf(stderr, "%s: %s\n", name, error);
+		exit(1);
+	}
+
+	return sym;
+} /* resolve */
+#endif /* CONFIG_ETENSE_PRELOAD */
 
 /* The main function */
 int main(int argc, char *argv[])
@@ -386,16 +481,38 @@ int main(int argc, char *argv[])
 	srand(opt_seed);
 	srand48(opt_seed);
 
+#ifdef CONFIG_ETENSE_PRELOAD
+	My_ETense_Tend_Leftward	= resolve("ETense_Tend_Leftward");
+	My_ETense_Protect_Under	= resolve("ETense_Protect_Under");
+	My_ETense_Protect_Over	= resolve("ETense_Protect_Over");
+	My_ETense_Zone_Check	= resolve("ETense_Zone_Check");
+	My_ETense_Check		= resolve("ETense_Check");
+#endif /* CONFIG_ETENSE_PRELOAD */
+
 #if CONFIG_ETENSE
-	signal(SIGCHLD, SIG_IGN);
 	ETense_Zone_Check = ETENSE_CHECK_ALWAYS;
 #endif
 
+	/* Get Pagesize. */
+#if defined(PAGE_SIZE)
+	Pagesize = PAGE_SIZE;
+#elif HAVE_GETPAGESIZE
+	Pagesize = getpagesize();
+#elif defined(_SC_PAGE_SIZE)
+	Pagesize = sysconf(_SC_PAGE_SIZE);
+#elif defined(_SC_PAGESIZE)
+	Pagesize = sysconf(_SC_PAGESIZE);
+#else
+	Pagesize = 4096;
+#endif
+
+	/* Run */
 	if (opt_one)
 		test_one(opt_nrounds);
 	else
 		test_many(opt_nrounds, opt_nmems, opt_skipbut);
 
+	/* Done */
 	return 0;
 } /* main */
 

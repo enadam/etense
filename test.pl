@@ -1,69 +1,70 @@
 #!/usr/bin/perl -w
 #
-# XXX This is broken now.
+# test.pl -- verify that test.c has completed without errors
 #
+# Synopsis:
+#   test.pl [<nturns>] [<test-program> [<arguments>]...]
+#
+# Where testprogram is either "testeld" (the default) or "pretest".
+# The difference between them is that the former links with -lefence
+# at compile time, while the latter needs it LD_PRELOAD:ed.  <nturns>
+# specify how many times to run the test program (once by default).
 
 use strict;
 
-my ($round, $slot);
-my $cancel;
-my @faulty;
-my $grep;
+my $nfaults = 0;
+my $error = 'etense: chkzone: red zone integrity violated';
 
-@ARGV && $ARGV[0] =~ /^\d+$/
-	and $grep = shift;
-$round = $slot = 0;
-
-my $next;
-$_ = <>;
-$next = <>;
-for (;;)
+# Parse the command line.
+my $turns = @ARGV && $ARGV[0] =~ /^\d+/ ? shift : 1;
+push(@ARGV, 'testeld') if !@ARGV;
+if ($ARGV[0] eq "testeld")
 {
-	defined $grep && $grep == $slot
-		and print;
+	$ENV{'LD_LIBRARY_PATH'} = '.';
+} else
+{
+	$ENV{'LD_PRELOAD'} = './libetense.so';
+}
+$ARGV[0] = "./$ARGV[0]"
+	if index($ARGV[0], '/') < 0;
 
-	if ($_ eq "DONE!\n")
+# Run
+for (1..$turns)
+{
+	my $pid;
+	local (*RFH, *WFH);
+
+	pipe(RFH, WFH)
+		or die;
+	if (!($pid = fork()))
 	{
-		defined $grep && $grep != $slot
-			and print;
-	} elsif ($_ eq "ROUND\n")
-	{
-		defined $grep && $grep != $slot
-			and print;
-		$round++;
-		$slot = 0;
-	} elsif ($_ eq "ALLOC\n")
-	{
-		die unless $next eq "NEGTEST\n";
-	} elsif ($_ eq "REALLOC\n")
-	{
-		$slot++ unless $next eq "NEGTEST\n";
-	} elsif ($_ eq "NEGTEST\n")
-	{
-		$next eq "FUCKUP\n" || $next =~ /^red zone integrity violated/
-			or $slot++;
-	} elsif ($_ eq "FUCKUP\n")
-	{
-		print "round: $round, slot: $slot\n"
-			if !defined $grep;
-		push(@faulty, $slot);
-		$slot++;
-	} elsif (/Assertion .* failed\.$/)
-	{
-		push(@faulty, $slot++);
-	} else
-	{
-		$slot++;
+		close(RFH);
+		open(STDOUT, '>&', WFH);
+		open(STDERR, '>&', WFH);
+		exec(@ARGV);
+		die;
 	}
 
-	($_ = $next) ne ''
-		or last;
-	defined ($next = <>)
-		or $next = '';
+	$SIG{'__DIE__'} = sub { kill(TERM => $pid); die @_ };
+
+	print "TURN $_\n";
+	close(WFH);
+	for (;;)
+	{
+		die if !defined ($_ = <RFH>);
+		print if /\bROUND$/;
+		last if /\bDONE!$/;
+		next unless /\bNEGTEST (?:OVER|UNDER)$/;
+		die if !defined ($_ = <RFH>);
+		$nfaults++;
+		next if /\bSIGSEGV$/;
+		next if /\(buffer (?:over|under)run\?\)$/;
+		die;
+	}
+	close(RFH);
+
+	die if !$nfaults;
+	print "faulted $nfaults times\n";
 }
 
-print join("\n", "Faulty slots:", sort({ $a <=> $b } @faulty)), "\n"
-	if !defined $grep && @faulty;
-
-# 184
-# 1164145456
+# End of test.pl
